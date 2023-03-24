@@ -97,9 +97,7 @@ func TestMain(m *testing.M) {
 	)
 	flag.StringVar(&bst, "bench_store", "", "store type for bench tests (mem, file)")
 	flag.StringVar(&pst, "persistent_store", "", "store type for server recovery related tests (file)")
-	// This one is added here so that if we want to disable sql for stores tests
-	// we can use the same param for all packages as in "go test -v ./... -sql=false"
-	flag.Bool("sql", false, "Not used for server tests")
+	flag.BoolVar(&doSQL, "sql", true, "Enable/disable SQL tests in server package")
 	// Those 2 sql related flags are handled here, not in AddSQLFlags
 	flag.BoolVar(&sqlCreateDb, "sql_create_db", true, "create sql database on startup")
 	flag.BoolVar(&sqlDeleteDb, "sql_delete_db", true, "delete sql database on exit")
@@ -131,7 +129,7 @@ func TestMain(m *testing.M) {
 
 	// If either (or both) bench or tests select an SQL store, we need to do
 	// so initializing and cleaning at the end of the test.
-	doSQL = benchStoreType == stores.TypeSQL || persistentStoreType == stores.TypeSQL
+	doSQL = doSQL || benchStoreType == stores.TypeSQL || persistentStoreType == stores.TypeSQL
 
 	if doSQL {
 		defaultSources := make(map[string][]string)
@@ -1702,6 +1700,152 @@ func TestInternalSubsLimits(t *testing.T) {
 			if count, sz, err := s.subSub.PendingLimits(); err != nil || count == -1 || sz == -1 {
 				t.Fatalf("The subSub subscription should not be unlimited: err=%v count=%v sz=%v", err, count, sz)
 			}
+		})
+	}
+}
+
+func TestChannelNameRejectedIfAlreadyExistsWithDifferentCase(t *testing.T) {
+	for _, tinfo := range []struct {
+		name    string
+		st      string
+		restart bool
+	}{
+		{"memory", stores.TypeMemory, false},
+		{"file", stores.TypeFile, true},
+		{"sql", stores.TypeSQL, true},
+		{"clustered", stores.TypeFile, true},
+	} {
+		t.Run(tinfo.name, func(t *testing.T) {
+			var o *Options
+			if tinfo.st == stores.TypeSQL {
+				if !doSQL {
+					t.SkipNow()
+				}
+			}
+			// Force persistent store to be the tinfo.st for this test.
+			orgps := persistentStoreType
+			persistentStoreType = tinfo.st
+			defer func() { persistentStoreType = orgps }()
+
+			if tinfo.st == stores.TypeSQL || tinfo.st == stores.TypeFile {
+				o = getTestDefaultOptsForPersistentStore()
+			} else if tinfo.st == stores.TypeMemory {
+				o = GetDefaultOptions()
+			}
+
+			cleanupDatastore(t)
+			defer cleanupDatastore(t)
+			cleanupRaftLog(t)
+			defer cleanupRaftLog(t)
+
+			var servers []*StanServer
+			if tinfo.name == "clustered" {
+				ns := natsdTest.RunDefaultServer()
+				defer ns.Shutdown()
+
+				o1 := getTestDefaultOptsForClustering("a", true)
+				servers = append(servers, runServerWithOpts(t, o1, nil))
+				o2 := getTestDefaultOptsForClustering("b", false)
+				servers = append(servers, runServerWithOpts(t, o2, nil))
+				o3 := getTestDefaultOptsForClustering("c", false)
+				servers = append(servers, runServerWithOpts(t, o3, nil))
+			} else {
+				servers = append(servers, runServerWithOpts(t, o, nil))
+			}
+			for _, s := range servers {
+				defer s.Shutdown()
+			}
+
+			sc := NewDefaultConnection(t)
+			defer sc.Close()
+
+			sendOK := func(channel, content string) {
+				t.Helper()
+				if err := sc.Publish(channel, []byte(content)); err != nil {
+					t.Fatalf("Error on send: %v", err)
+				}
+			}
+			sendFail := func(channel, content string) {
+				t.Helper()
+				err := sc.Publish(channel, []byte(content))
+				if err == nil || !strings.Contains(err.Error(), "exists") {
+					t.Fatalf("Expected error that channel already exists, got: %v", err)
+				}
+			}
+			sendOK("Foo", "1")
+			sendOK("Foo", "2")
+			sendOK("Foo", "3")
+			sendOK("Foo", "4")
+			// Change channel name case
+			sendFail("foo", "1")
+			sendFail("foo", "2")
+			// Back to "Foo"
+			sendOK("Foo", "5")
+			sendOK("Foo", "6")
+
+			recvOK := func(channel string) {
+				t.Helper()
+
+				ch := make(chan *stan.Msg, 6)
+				sub, err := sc.Subscribe(channel, func(m *stan.Msg) {
+					ch <- m
+				}, stan.DeliverAllAvailable())
+				if err != nil {
+					t.Fatalf("Error on subscribe: %v", err)
+				}
+				defer sub.Unsubscribe()
+
+				// We want to get all 6 messages
+				for i := 0; i < 6; i++ {
+					select {
+					case m := <-ch:
+						if v, err := strconv.ParseInt(string(m.Data), 10, 64); err != nil || int(v) != i+1 {
+							t.Fatalf("Invalid message %v: %s", i+1, m.Data)
+						}
+					case <-time.After(time.Second):
+						t.Fatalf("Failed receiving message %v", i+1)
+					}
+				}
+			}
+			recvFail := func(channel string) {
+				t.Helper()
+
+				_, err := sc.Subscribe(channel, func(m *stan.Msg) {}, stan.DeliverAllAvailable())
+				if err == nil || !strings.Contains(err.Error(), "exists") {
+					t.Fatalf("Expected error that channel already exists, got %v", err)
+				}
+			}
+			recvOK("Foo")
+			recvFail("foo")
+			recvFail("FoO")
+
+			if !tinfo.restart {
+				return
+			}
+
+			sc.Close()
+
+			for i, s := range servers {
+				s.Shutdown()
+				s.mu.RLock()
+				opts := s.opts
+				s.mu.RUnlock()
+				s = runServerWithOpts(t, opts, nil)
+				defer s.Shutdown()
+				servers[i] = s
+			}
+
+			if tinfo.name == "clustered" {
+				getLeader(t, 10*time.Second, servers...)
+			}
+
+			sc = NewDefaultConnection(t)
+			defer sc.Close()
+
+			// Try to receive again, but change the order...
+			recvFail("foo")
+			recvOK("Foo")
+			recvFail("FoO")
 		})
 	}
 }

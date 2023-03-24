@@ -3,8 +3,8 @@
 
 export GO111MODULE="on"
 
-go get github.com/mattn/goveralls
-go get github.com/wadey/gocovmerge
+go install github.com/mattn/goveralls@latest
+go install github.com/wadey/gocovmerge@latest
 
 rm -rf ./cov
 mkdir cov
